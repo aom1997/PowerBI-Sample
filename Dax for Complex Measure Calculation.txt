@@ -1,0 +1,174 @@
+let
+    Source = Sql.Database("ehalliance.database.windows.net", "EHAlliance", [Query="#(lf)        SELECT #(lf)            [PatientMRN], [PatientVisitID], [DeptName], [DOB], [ArrivalAgeInDays], [Gender],#(lf)            [PatientZip], [ArriveMode], [ChiefComplaint], [TriageAcuity], [EDUnit], [EDRoom], [EDBed],#(lf)            [Disposition], [AdmissionType], [DiagnosisDisp], [DiagnosisCode], [ArrivalDtTm], [RegistrationDtTm],#(lf)            [TriageStartDtTm], [TriageEndDtTm], [TriageRN], [InitialBedDtTm], [RNEvalDtTm], [RNEvalFullName],#(lf)            [FirstProvDtTm], [FirstProvFullName], [FirstProvDEA], [FirstProvNPI], [FirstOrderDtTm],#(lf)            [DispositionDecisionDtTm], [DispositionProvFullName], [DispositionProvDEA], [DispositionProvNPI],#(lf)            [BedOrderedDtTm], [BedAssignedDtTm], [BedApprovedDtTm], [DepartureDtTm], [AdmissionOrderDtTm],#(lf)            [DeparturePrsnl], [MentalHealth], [Trauma], [TransferRequest]#(lf)        FROM#(lf)            (SELECT *, ROW_NUMBER() OVER (PARTITION BY PatientVisitID ORDER BY [FileName] DESC) as RN_NUMBER#(lf)             FROM [dbo].[fndata_DB]#(lf)             WHERE CAST(ArrivalDtTm AS DATE) = CAST(DATEADD(DAY,-1,GETDATE() AT TIME ZONE 'UTC' AT TIME ZONE 'EASTERN STANDARD TIME') AS DATE) #(tab)#(tab)#(lf)#(tab)#(tab)#(tab)) A#(lf)        WHERE RN_NUMBER = 1#(lf)#(lf)"]),
+
+    KeepCols = Table.SelectColumns(Source, {
+        "DeptName","DOB","ArrivalAgeInDays","Gender","PatientZip","ArriveMode","ChiefComplaint",
+        "TriageAcuity","EDUnit","EDRoom","EDBed","Disposition","AdmissionType","DiagnosisDisp",
+        "DiagnosisCode","ArrivalDtTm","RegistrationDtTm","TriageStartDtTm","TriageEndDtTm",
+        "TriageRN","InitialBedDtTm","RNEvalDtTm","RNEvalFullName","FirstProvDtTm","FirstProvFullName",
+        "FirstProvDEA","FirstProvNPI","FirstOrderDtTm","DispositionDecisionDtTm","DispositionProvFullName",
+        "DispositionProvDEA","DispositionProvNPI","BedOrderedDtTm","BedAssignedDtTm","BedApprovedDtTm",
+        "DepartureDtTm","AdmissionOrderDtTm","DeparturePrsnl","MentalHealth","Trauma","TransferRequest"
+    }),
+
+    ChangedTypes = Table.TransformColumnTypes(KeepCols,{{"ArrivalDtTm", type datetime}, {"DepartureDtTm", type datetime}, {"DispositionDecisionDtTm", type datetime}, {"FirstProvDtTm", type datetime}, {"InitialBedDtTm", type datetime}, {"BedOrderedDtTm", type datetime}, {"ArrivalAgeInDays", Int64.Type}}),
+
+    AddAge = Table.AddColumn(ChangedTypes, "Age", each if [ArrivalAgeInDays] <> null then Number.IntegerDivide([ArrivalAgeInDays], 365) else null),
+
+    ModeOfArrival = Table.AddColumn(AddAge, "Mode_of_Arrival", each
+        let mode = Text.Lower(Text.Trim(Text.From([ArriveMode]))) in
+        if mode = "private vehicle" then "Walk-In"
+        else if List.Contains({"ambulance", "als/ambulance", "ambulatory", "bls/ambulance"}, mode) then "EMS"
+        else if mode = "law enforcement" then "Law Enforcement"
+        else "Other"
+    ),
+
+    Disposition1 = Table.AddColumn(ModeOfArrival, "Disposition1", each
+        let d = Text.Lower(Text.Trim(Text.From([Disposition]))) in
+        if d = "ed discharge to other facility" then "Transfer"
+        else if d = "ed elopment" then "Elope"
+        else if d = "ed expired/doa" then "Expired"
+        else if d = "ed home, routine" then "Discharged"
+        else if d = "ed left against medical advice" then "AMA"
+        else if d = "ed left before mse" then "LWBS"
+        else if d = "ed registration error" then "Registration Error"
+        else if d = "inpatient" then "Admit"
+        else if d = "observation" then "Observation"
+        else "Pending Dispo"
+    ),
+
+    AddTimeToProvider = Table.AddColumn(Disposition1, "Time to Provider (min)", each
+        let arrive = [ArrivalDtTm], prov = [FirstProvDtTm], dispo = [Disposition1] in
+        if arrive <> null and prov <> null and arrive <= prov and dispo <> "LWBS" then Duration.TotalMinutes(prov - arrive) else null
+    ),
+
+    AddLOS = Table.AddColumn(AddTimeToProvider, "LOS Total (min)", each
+        let arrive = [ArrivalDtTm], depart = [DepartureDtTm], today = DateTime.LocalNow() + #duration(10,0,0,0) in
+        if arrive <> null and depart <> null and depart <= today then Duration.TotalMinutes(depart - arrive) else null
+    ),
+
+    DecisionToAOT = Table.AddColumn(AddLOS, "Decision to AOT (min)", each
+        let d = [DispositionDecisionDtTm], o = [BedOrderedDtTm] in
+        if d <> null and o <> null then
+            if o < d then 0 else Duration.TotalMinutes(o - d)
+        else null
+    ),
+
+    AOTtoDepart = Table.AddColumn(DecisionToAOT, "AOT to Depart (min)", each
+        let o = [BedOrderedDtTm], dep = [DepartureDtTm], today = DateTime.LocalNow() + #duration(10,0,0,0) in
+        if o <> null and dep <> null and dep <= today then Duration.TotalMinutes(dep - o) else null
+    ),
+
+    DecisionToDepartureAdmit = Table.AddColumn(AOTtoDepart, "Decision to Departure - Admit (min)", each
+        let d = [DispositionDecisionDtTm], o = [BedOrderedDtTm], dep = [DepartureDtTm], dispo = Text.Lower([Disposition1]), today = DateTime.LocalNow() + #duration(10,0,0,0) in
+        if d <> null and o <> null and dep <> null and dep <= today and List.Contains({"admit","observation"}, dispo)
+        then Duration.TotalMinutes(dep - List.Min({d,o})) else null
+    ),
+
+    ArrivalToRoom = Table.AddColumn(DecisionToDepartureAdmit, "Arrival to Room (min)", each let
+    a = [ArrivalDtTm],
+    b = [InitialBedDtTm]
+in
+    if a <> null and b <> null then List.Max({0, Duration.TotalMinutes(Duration.From(b - a))}) else null),
+    BoardingTime = Table.AddColumn(ArrivalToRoom, "Boarding Time (decision to departure AOT)", each 
+    let
+        dispo = Text.Lower(Text.Trim(Text.From([Disposition1]))),
+        depart = [DepartureDtTm],
+        decision = [DispositionDecisionDtTm],
+        today = DateTime.Date(DateTime.LocalNow()),
+        departDate = if depart <> null then DateTime.Date(depart) else null,
+        decisionDate = if decision <> null then DateTime.Date(decision) else null,
+        tenDaysLater = Date.AddDays(today, 10)
+    in
+        if (dispo = "admit" or dispo = "observation") and depart <> null and decision <> null and depart > decision then
+            if departDate = decisionDate then
+                Duration.TotalMinutes(depart - decision)
+            else if departDate > decisionDate then
+                if departDate > tenDaysLater then
+                    Duration.TotalMinutes(DateTime.From(Date.AddDays(decisionDate, 1)) - decision)
+                else
+                    Duration.TotalMinutes(depart - DateTime.From(departDate))
+            else
+                null
+        else
+            null
+),
+
+    RoomToProvider = Table.AddColumn(BoardingTime, "Room to Provider (min)", each
+        let b = [InitialBedDtTm], p = [FirstProvDtTm] in
+        if b <> null and p <> null and p >= b then Duration.TotalMinutes(p - b) else null
+    ),
+
+    ArrivalToDispo = Table.AddColumn(RoomToProvider, "Arrival to Dispo (min)", each
+        if [ArrivalDtTm] <> null and [DispositionDecisionDtTm] <> null then Duration.TotalMinutes([DispositionDecisionDtTm] - [ArrivalDtTm]) else null
+    ),
+
+    ProviderToDispo = Table.AddColumn(ArrivalToDispo, "Provider to Dispo (min)", each
+        if [FirstProvDtTm] <> null and [DispositionDecisionDtTm] <> null then Duration.TotalMinutes([DispositionDecisionDtTm] - [FirstProvDtTm]) else null
+    ),
+
+    DecisionToDepartureDischarged = Table.AddColumn(ProviderToDispo, "Decision to Departure - Discharge (min)", each
+        let d = [DispositionDecisionDtTm], dep = [DepartureDtTm] in
+        if d <> null and dep <> null and [Disposition1] = "Discharged" and dep >= d then Duration.TotalMinutes(dep - d) else null
+    ),
+
+    AddArrivalDate = Table.AddColumn(DecisionToDepartureDischarged, "Arrival Date", each DateTime.Date([ArrivalDtTm])),
+
+    AddRoundedArrival = Table.AddColumn(AddArrivalDate, "Rounded_Arrival_Time", each let
+    a = [ArrivalDtTm]
+in
+    if a <> null and a < DateTime.LocalNow() then
+        Text.PadStart(Text.From(Number.IntegerDivide(Time.Hour(Time.From(a)), 1)), 2, "0") & ":" &
+        Text.PadStart(Text.From(Number.IntegerDivide(Time.Minute(Time.From(a)), 15) * 15), 2, "0")
+    else 
+        null),
+
+    AddRoundedDeparture = Table.AddColumn(AddRoundedArrival, "Rounded_Departure_Time", each let
+    dep = [DepartureDtTm],
+    now = DateTime.LocalNow() + #duration(10, 0, 0, 0)
+in
+    if dep <> null and dep <= now then
+        Text.PadStart(Text.From(Time.Hour(dep)), 2, "0") & ":" &
+        Text.PadStart(Text.From(Number.IntegerDivide(Time.Minute(dep), 15) * 15), 2, "0")
+    else
+        null),
+    #"Renamed Columns" = Table.RenameColumns(AddRoundedDeparture,{{"LOS Total (min)", "LOS Total"}, {"Time to Provider (min)", "Time to Provider"}, {"Decision to AOT (min)", "Decision to AOT"}, {"AOT to Depart (min)", "AOT to Depart"}, {"Decision to Departure - Admit (min)", "Decision to Departure - Admit"}, {"Arrival to Room (min)", "Arrival to Room"}, {"Room to Provider (min)", "Room to Provider"}, {"Arrival to Dispo (min)", "Arrival to Dispo"}, {"Provider to Dispo (min)", "Provider to Dispo"}, {"Decision to Departure - Discharge (min)", "Decision to Departure - Discharge"}}),
+    #"Changed Type" = Table.TransformColumnTypes(#"Renamed Columns",{{"Rounded_Departure_Time", type time}, {"Rounded_Arrival_Time", type time}, {"Arrival Date", type date}, {"Decision to Departure - Discharge", Int64.Type}, {"Provider to Dispo", Int64.Type}, {"Arrival to Dispo", Int64.Type}, {"Room to Provider", Int64.Type}, {"Arrival to Room", Int64.Type}, {"Decision to Departure - Admit", Int64.Type}, {"AOT to Depart", Int64.Type}, {"Decision to AOT", Int64.Type}, {"LOS Total", Int64.Type}, {"Time to Provider", Int64.Type}, {"Disposition1", type text}, {"Mode_of_Arrival", type text}, {"Age", Int64.Type}, {"TransferRequest", type text}, {"Trauma", type text}, {"MentalHealth", type text}}),
+    LOS_Dot = Table.AddColumn(
+    #"Changed Type", 
+    "LOS-DAOT", 
+    each 
+        let dispo = try Text.Lower(Text.From([Disposition1])) otherwise ""
+        in if dispo = "admit" or dispo = "observation" or dispo = "discharged"
+           then [LOS Total] 
+           else null
+),
+    Dispo_Date = Table.AddColumn(
+    #"LOS_Dot", 
+    "Dispo_Date", 
+    each Date.From([DispositionDecisionDtTm]), 
+    type date
+),
+    ED_Index = Table.AddColumn(
+    #"Dispo_Date", 
+    "ED Severity Index", 
+    each 
+        let val = Text.Lower(Text.From([TriageAcuity]))
+        in 
+            if val = "1  - resuscitation" then "ESI 1 - Resuscitation"
+            else if val = "2  - emergent" or val = "2 emergent" then "ESI 2 - Emergent"
+            else if val = "3  - urgent" or val = "3 - urgent" then "ESI 3 - Urgent"
+            else if val = "4  - less urgent" or val = "4 - less urgent" then "ESI 4 - Less Urgent"
+            else if val = "5  - nonurgent" or val = "5 - nonurgent" then "ESI 5 - Nonurgent"
+            else "Unknown",
+    type text
+),
+    #"Changed Type1" = Table.TransformColumnTypes(ED_Index,{{"LOS-DAOT", Int64.Type}, {"Boarding Time (decision to departure AOT)", Int64.Type}}),
+    #"Added Custom" = Table.AddColumn(#"Changed Type1", "WholeDepartmentName", each if [DeptName] = "MMH" then "Manatee Memorial Hospital"
+  else if [DeptName] = "BAY" then "ER at Bayshore Gardens"
+  else if [DeptName] = "SUN" then "ER at Sun City Center"
+  else if [DeptName] = "LWR" then "Lakewood Ranch Medical Center"
+  else if [DeptName] = "FRU" then "ER at Fruitville"
+  else null)
+in
+    #"Added Custom"
